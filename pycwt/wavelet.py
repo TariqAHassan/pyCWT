@@ -2,18 +2,16 @@
 from __future__ import (absolute_import, division, print_function,
                         unicode_literals)
 
-import os
-import tqdm
-
-
+from tqdm import tqdm
 import numpy as np
 from scipy.stats import chi2
-from .helpers import (ar1, ar1_spectrum, fft, fft_kwargs, find, get_cache_dir,
-                      rednoise)
+from .helpers import (efficient_2d_1d_matmul, ar1, ar1_spectrum, fft, fft_kwargs,
+                      find, get_cache_dir, rednoise)
 from .mothers import Morlet, Paul, DOG, MexicanHat
 
 
-def cwt(signal, dt, dj=1/12, s0=-1, J=-1, wavelet='morlet', freqs=None):
+def cwt(signal, dt, dj=1 / 12, s0=-1, J=-1,
+        wavelet='morlet', freqs=None, wavelet_only=False, threads=-1):
     """Continuous wavelet transform of the signal at specified scales.
 
     Parameters
@@ -38,6 +36,11 @@ def cwt(signal, dt, dj=1/12, s0=-1, J=-1, wavelet='morlet', freqs=None):
         Custom frequencies to use instead of the ones corresponding
         to the scales described above. Corresponding scales are
         calculated using the wavelet Fourier wavelength.
+    wavelet_only : bool
+        Return only `W` and `sj`.
+    threads : int
+        Number of processing threads to use when performing Fourier Transforms.
+        (Requires `pyFFTW` to be installed).
 
     Returns
     -------
@@ -103,10 +106,13 @@ def cwt(signal, dt, dj=1/12, s0=-1, J=-1, wavelet='morlet', freqs=None):
     #       frequency f;
     # (iii) Calculate wavelet transform;
     sj_col = sj[:, np.newaxis]
-    psi_ft_bar = ((sj_col * ftfreqs[1] * N) ** .5 *
-                  np.conjugate(wavelet.psi_ft(sj_col * ftfreqs)))
-    W = fft.ifft(signal_ft * psi_ft_bar, axis=1,
-                 **fft_kwargs(signal_ft, overwrite_x=True))
+    sj_ft_matmul = efficient_2d_1d_matmul(two_d=sj_col, one_d=ftfreqs)
+    psi_ft_bar = (sj_col * ftfreqs[1] * N) ** .5 * np.conjugate(wavelet.psi_ft(f=sj_ft_matmul))
+    signal_psi_ft_matmul = np.ascontiguousarray(signal_ft * psi_ft_bar)
+    del sj_col, sj_ft_matmul, psi_ft_bar  # no longer needed
+
+    W = fft.ifft(signal_psi_ft_matmul, axis=1,
+                 **fft_kwargs(signal_ft, threads=threads, overwrite_x=True))
 
     # Checks for NaN in transform results and removes them from the scales if
     # needed, frequencies and wavelet transform. Trims wavelet transform at
@@ -117,17 +123,20 @@ def cwt(signal, dt, dj=1/12, s0=-1, J=-1, wavelet='morlet', freqs=None):
         freqs = freqs[sel]
         W = W[sel, :]
 
+    if wavelet_only:
+        return W[:, :n0], sj
+
     # Determines the cone-of-influence. Note that it is returned as a function
     # of time in Fourier periods. Uses triangualr Bartlett window with
     # non-zero end-points.
     coi = (n0 / 2 - np.abs(np.arange(0, n0) - (n0 - 1) / 2))
     coi = wavelet.flambda() * wavelet.coi() * dt * coi
 
-    return (W[:, :n0], sj, freqs, coi, signal_ft[1:N//2] / N ** 0.5,
-            ftfreqs[1:N//2] / (2 * np.pi))
+    return (W[:, :n0], sj, freqs, coi, signal_ft[1:N // 2] / N ** 0.5,
+            ftfreqs[1:N // 2] / (2 * np.pi))
 
 
-def icwt(W, sj, dt, dj=1/12, wavelet='morlet'):
+def icwt(W, sj, dt, dj=1 / 12, wavelet='morlet'):
     """Inverse continuous wavelet transform.
 
     Parameters
@@ -246,19 +255,20 @@ def significance(signal, dt, scales, sigma_test=0, alpha=None,
         alpha, _, _ = ar1(signal)
 
     period = scales * wavelet.flambda()  # Fourier equivalent periods
-    freq = dt / period                   # Normalized frequency
-    dofmin = wavelet.dofmin              # Degrees of freedom with no smoothing
-    Cdelta = wavelet.cdelta              # Reconstruction factor
-    gamma_fac = wavelet.gamma            # Time-decorrelation factor
-    dj0 = wavelet.deltaj0                # Scale-decorrelation factor
+    freq = dt / period  # Normalized frequency
+    dofmin = wavelet.dofmin  # Degrees of freedom with no smoothing
+    Cdelta = wavelet.cdelta  # Reconstruction factor
+    gamma_fac = wavelet.gamma  # Time-decorrelation factor
+    dj0 = wavelet.deltaj0  # Scale-decorrelation factor
 
     # Theoretical discrete Fourier power spectrum of the noise signal
     # following Gilman et al. (1963) and Torrence and Compo (1998),
     # equation 16.
     def pk(k, a, N):
         return (1 - a ** 2) / (1 + a ** 2 - 2 * a * np.cos(2 * np.pi * k / N))
+
     fft_theor = pk(freq, alpha, n0)
-    fft_theor = variance * fft_theor     # Including time-series variance
+    fft_theor = variance * fft_theor  # Including time-series variance
     signif = fft_theor
 
     try:
@@ -274,7 +284,7 @@ def significance(signal, dt, scales, sigma_test=0, alpha=None,
         signif = fft_theor * chisquare
     elif sigma_test == 1:  # Time-averaged significance
         if len(dof) == 1:
-            dof = np.zeros(1, J+1) + dof
+            dof = np.zeros(1, J + 1) + dof
         sel = find(dof < 1)
         dof[sel] = 1
         # As in Torrence and Compo (1998), equation 23:
@@ -316,7 +326,7 @@ def significance(signal, dt, scales, sigma_test=0, alpha=None,
     return signif, fft_theor
 
 
-def xwt(y1, y2, dt, dj=1/12, s0=-1, J=-1, significance_level=0.95,
+def xwt(y1, y2, dt, dj=1 / 12, s0=-1, J=-1, significance_level=0.95,
         wavelet='morlet', normalize=True):
     """Cross wavelet transform (XWT) of two signals.
 
@@ -422,7 +432,7 @@ def xwt(y1, y2, dt, dj=1/12, s0=-1, J=-1, significance_level=0.95,
     return W12, coi, freq, signif
 
 
-def wct(y1, y2, dt, dj=1/12, s0=-1, J=-1, sig=True,
+def wct(y1, y2, dt, dj=1 / 12, s0=-1, J=-1, sig=True,
         significance_level=0.95, wavelet='morlet', normalize=True, **kwargs):
     """Wavelet coherence transform (WCT).
 
@@ -519,7 +529,7 @@ def wct(y1, y2, dt, dj=1/12, s0=-1, J=-1, sig=True,
 
 
 def wct_significance(al1, al2, dt, dj, s0, J, significance_level=0.95,
-                     wavelet='morlet', mc_count=300, 
+                     wavelet='morlet', mc_count=300, progress=True,
                      cache=True):
     """Wavelet coherence transform significance.
 
@@ -548,6 +558,8 @@ def wct_significance(al1, al2, dt, dj, s0, J, significance_level=0.95,
         Mother wavelet class. Default is Morlet wavelet.
     mc_count : integer, optional
         Number of Monte Carlo simulations. Default is 300.
+    progress : bool, optional
+        If `True` (default), shows progress bar on screen.
     cache : bool, optional
         If `True` (default) saves cache to file.
 
@@ -556,13 +568,12 @@ def wct_significance(al1, al2, dt, dj, s0, J, significance_level=0.95,
     TODO
 
     """
-
     if cache:
         # Load cache if previously calculated. It is assumed that wavelet
         # analysis is performed using the wavelet's default parameters.
         aa = np.round(np.arctanh(np.array([al1, al2]) * 4))
         aa = np.abs(aa) + 0.5 * (aa < 0)
-        cache_file = 'wct_sig_{:0.5f}_{:0.5f}_{:0.5f}_{:0.5f}_{:d}_{}'\
+        cache_file = 'wct_sig_{:0.5f}_{:0.5f}_{:0.5f}_{:0.5f}_{:d}_{}' \
             .format(aa[0], aa[1], dj, s0 / dt, J, wavelet.name)
         cache_dir = get_cache_dir()
         try:
@@ -572,9 +583,6 @@ def wct_significance(al1, al2, dt, dj, s0, J, significance_level=0.95,
             return dat
         except IOError:
             pass
-
-    # Some output to the screen
-    print('Calculating wavelet coherence significance')
 
     # Choose N so that largest scale has at least some part outside the COI
     ms = s0 * (2 ** (J * dj)) / dt
@@ -593,8 +601,7 @@ def wct_significance(al1, al2, dt, dj, s0, J, significance_level=0.95,
 
     nbins = 1000
     wlc = np.ma.zeros([J + 1, nbins])
-    # Displays progress bar with tqdm
-    for i in tqdm.tqdm(range(mc_count)):
+    for i in tqdm(range(mc_count), disable=not progress):
         # Generates two red-noise signals with lag-1 autoregressive
         # coefficients given by al1 and al2
         noise1 = rednoise(N, al1, 1)
@@ -616,7 +623,7 @@ def wct_significance(al1, al2, dt, dj, s0, J, significance_level=0.95,
             cd = np.floor(R2[s, :] * nbins)
             for j, t in enumerate(cd[~cd.mask]):
                 wlc[s, int(t)] += 1
-
+                # Outputs some text to screen if desired
 
     # After many, many, many Monte Carlo simulations, determine the
     # significance using the coherence coefficient counter percentile.

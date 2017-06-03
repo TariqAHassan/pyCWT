@@ -2,7 +2,10 @@
 from __future__ import (absolute_import, division, print_function,
                         unicode_literals)
 
+from warnings import warn
+
 import numpy as np
+
 # Try to import the Python wrapper for FFTW.
 try:
     import pyfftw.interfaces.scipy_fftpack as fft
@@ -12,26 +15,42 @@ try:
     _FFTW_KWARGS_DEFAULT = {'planner_effort': 'FFTW_ESTIMATE',
                             'threads': cpu_count()}
 
-    def fft_kwargs(signal, **kwargs):
+
+    def fft_kwargs(signal, threads=-1, **kwargs):
         """Return optimized keyword arguments for FFTW"""
         kwargs.update(_FFTW_KWARGS_DEFAULT)
         kwargs['n'] = len(signal)  # do not pad
+        if isinstance(threads, int) and threads > 0:
+            kwargs['threads'] = threads
+        elif threads != -1:
+            raise ValueError("`threads` must be an integer greater than zero.")
         return kwargs
 
 # Otherwise, fall back to 2 ** n padded scipy FFTPACK
 except ImportError:
     import scipy.fftpack as fft
+
     # Can be turned off, e.g. for MKL optimizations
     _FFT_NEXT_POW2 = True
 
-    def fft_kwargs(signal, **kwargs):
+
+    def fft_kwargs(signal, threads=-1, **kwargs):
         """Return next higher power of 2 for given signal to speed up FFT"""
+        if isinstance(threads, int) and threads > 0:
+            warn("`threads` is not valid when using `scipy.fftpack` FFT backend.")
         if _FFT_NEXT_POW2:
             return {'n': np.int(2 ** np.ceil(np.log2(len(signal))))}
 
 from scipy.signal import lfilter
 from os import makedirs
 from os.path import exists, expanduser
+
+
+def efficient_2d_1d_matmul(two_d, one_d):
+    out = np.ascontiguousarray(np.empty((two_d.shape[0], one_d.shape[0])))
+    out[:] = two_d  # shallow copy
+    out *= one_d
+    return out
 
 
 def find(condition):
@@ -81,25 +100,25 @@ def ar1(x):
 
     # Estimates the lag zero and one covariance
     c0 = x.transpose().dot(x) / N
-    c1 = x[0:N-1].transpose().dot(x[1:N]) / (N - 1)
+    c1 = x[0:N - 1].transpose().dot(x[1:N]) / (N - 1)
 
     # According to A. Grinsteds' substitutions
-    B = -c1 * N - c0 * N**2 - 2 * c0 + 2 * c1 - c1 * N**2 + c0 * N
-    A = c0 * N**2
+    B = -c1 * N - c0 * N ** 2 - 2 * c0 + 2 * c1 - c1 * N ** 2 + c0 * N
+    A = c0 * N ** 2
     C = N * (c0 + c1 * N - c1)
-    D = B**2 - 4 * A * C
+    D = B ** 2 - 4 * A * C
 
     if D > 0:
-        g = (-B - D**0.5) / (2 * A)
+        g = (-B - D ** 0.5) / (2 * A)
     else:
         raise Warning('Cannot place an upperbound on the unbiased AR(1). '
                       'Series is too short or trend is to large.')
 
     # According to Allen & Smith (1996), footnote 4
-    mu2 = -1 / N + (2 / N**2) * ((N - g**N) / (1 - g) -
-                                 g * (1 - g**(N - 1)) / (1 - g)**2)
+    mu2 = -1 / N + (2 / N ** 2) * ((N - g ** N) / (1 - g) -
+                                   g * (1 - g ** (N - 1)) / (1 - g) ** 2)
     c0t = c0 / (1 - mu2)
-    a = ((1 - g**2) * c0t) ** 0.5
+    a = ((1 - g ** 2) * c0t) ** 0.5
 
     return g, a, mu2
 
@@ -138,7 +157,7 @@ def ar1_spectrum(freqs, ar1=0.):
     #
     freqs = np.asarray(freqs)
     Pk = (1 - ar1 ** 2) / np.abs(1 - ar1 * np.exp(-2 * np.pi * 1j * freqs)) \
-        ** 2
+                          ** 2
 
     return Pk
 
